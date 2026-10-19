@@ -5,6 +5,7 @@ pub mod errors;
 pub mod fees;
 pub mod rate_limit;
 pub mod storage;
+pub mod timelock;
 pub mod types;
 
 pub use access::*;
@@ -13,6 +14,7 @@ pub use errors::*;
 pub use fees::*;
 pub use rate_limit::*;
 pub use storage::*;
+pub use timelock::*;
 pub use types::*;
 
 use soroban_sdk::xdr::ToXdr;
@@ -41,6 +43,7 @@ impl PaymentRouter {
     pub const CONTRACT_VERSION: &'static str = env!("CARGO_PKG_VERSION");
     pub const DEFAULT_MAX_SLIPPAGE_BPS: i128 = storage::DEFAULT_MAX_SLIPPAGE_BPS;
     pub const MAX_SLIPPAGE_BPS_LIMIT: i128 = storage::MAX_SLIPPAGE_BPS_LIMIT;
+    pub const MAX_PAIR_SLIPPAGE_BPS: i128 = storage::MAX_PAIR_SLIPPAGE_BPS;
     pub const DAY_IN_LEDGERS: u32 = storage::DAY_IN_LEDGERS;
     pub const INSTANCE_BUMP_AMOUNT: u32 = storage::INSTANCE_BUMP_AMOUNT;
     pub const INSTANCE_LIFETIME_THRESHOLD: u32 = storage::INSTANCE_LIFETIME_THRESHOLD;
@@ -118,10 +121,6 @@ impl PaymentRouter {
     #[inline]
     fn store_multisig_config(env: &Env, signers: Vec<Address>, threshold: u32) {
         access::store_multisig_config(env, signers, threshold);
-    }
-    #[inline]
-    fn validate_queued_action(env: &Env, action: &ActionType) -> Result<(), Error> {
-        access::validate_queued_action(env, action)
     }
     #[inline]
     fn load_fee_config(env: &Env) -> Result<(Address, i128, i128), Error> {
@@ -242,6 +241,24 @@ impl PaymentRouter {
             .instance()
             .get(&DataKey::MaxSlippageBps)
             .unwrap_or(Self::DEFAULT_MAX_SLIPPAGE_BPS)
+    }
+
+    /// Resolve the token-pair override, falling back to the legacy global cap.
+    /// Corrupt or out-of-range persisted overrides fail closed.
+    fn pair_max_slippage_bps(
+        env: &Env,
+        token_in: &Address,
+        token_out: &Address,
+    ) -> Result<i128, Error> {
+        let configured: Option<i128> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PairSlippage(token_in.clone(), token_out.clone()));
+        match configured {
+            Some(bps) if (0..=Self::MAX_PAIR_SLIPPAGE_BPS).contains(&bps) => Ok(bps),
+            Some(_) => Err(Error::InvalidSlippageConfig),
+            None => Ok(Self::max_slippage_bps(env)),
+        }
     }
 
     /// Returns whether a DEX router has been approved for swap routing.
@@ -844,101 +861,22 @@ impl PaymentRouter {
     ///
     /// On success the entry is removed and the underlying setter is invoked.
     pub fn execute_action(env: Env, nonce: u64) -> Result<(), Error> {
-        if Self::is_frozen_internal(&env) {
-            return Err(Error::ContractFrozen);
-        }
-        // Circuit breaker: applying a queued parameter change is a
-        // non-essential state change and is blocked while paused.
-        Self::require_circuit_closed(&env)?;
+        timelock::execute_action(&env, nonce)
+    }
 
-        let admin = Self::require_admin(&env)?;
-        admin.require_auth();
-
-        let key = DataKey::TimelockEntry(nonce);
-        let entry: TimelockEntry = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .ok_or(Error::TimelockNotFound)?;
-
-        let now = env.ledger().timestamp();
-        if now < entry.queued_at + Self::SECONDS_IN_24H {
-            return Err(Error::TimelockNotReady);
-        }
-
-        // Validate the action before touching storage so that a rejected entry
-        // stays in the queue for the admin to retry or cancel.  Upgrades are
-        // gated on the M-of-N threshold here as well as in `upgrade`, so
-        // routing an upgrade through the timelock is not a way around it.
-        Self::validate_queued_action(&env, &entry.action)?;
-
-        // Remove the entry before applying the action (checks-effects-interactions).
-        env.storage().persistent().remove(&key);
-
-        // Apply the action.
-        match entry.action {
-            ActionType::SetPlatformTreasury(new_treasury) => {
-                env.storage()
-                    .instance()
-                    .set(&DataKey::PlatformTreasury, &new_treasury);
-            }
-            ActionType::SetFeeConfig(fee_bps, fee_cap) => {
-                env.storage().instance().set(&DataKey::FeeBps, &fee_bps);
-                env.storage().instance().set(&DataKey::FeeCap, &fee_cap);
-            }
-            ActionType::SetFeeBps(new_fee_bps) => {
-                env.storage().instance().set(&DataKey::FeeBps, &new_fee_bps);
-            }
-            ActionType::SetGovernance(gov) => {
-                env.storage().instance().set(&DataKey::Governance, &gov);
-            }
-            ActionType::SetMinLimit(min_limit) => {
-                env.storage().instance().set(&DataKey::MinLimit, &min_limit);
-            }
-            ActionType::TransferAdmin(new_admin) => {
-                env.storage().instance().set(&DataKey::Admin, &new_admin);
-                Self::set_role_internal(&env, Role::SuperAdmin, &new_admin);
-            }
-            ActionType::SetBackupAdmin(backup, timeout_seconds) => {
-                Self::apply_set_backup_admin(&env, backup, timeout_seconds)?;
-            }
-            ActionType::Upgrade(new_wasm_hash) => {
-                Self::apply_upgrade(&env, &new_wasm_hash);
-            }
-            ActionType::SetMultisigConfig(signers, threshold) => {
-                Self::store_multisig_config(&env, signers, threshold);
-            }
-            ActionType::RegisterDex(dex) => {
-                let key = DataKey::RegisteredDex(dex.clone());
-                env.storage().persistent().set(&key, &true);
-                env.storage().persistent().extend_ttl(
-                    &key,
-                    Self::PERSISTENT_LIFETIME_THRESHOLD,
-                    Self::PERSISTENT_BUMP_AMOUNT,
-                );
-            }
-            ActionType::DeregisterDex(dex) => {
-                env.storage()
-                    .persistent()
-                    .remove(&DataKey::RegisteredDex(dex.clone()));
-            }
-            ActionType::SetMaxSlippageBps(max_slippage_bps) => {
-                env.storage()
-                    .instance()
-                    .set(&DataKey::MaxSlippageBps, &max_slippage_bps);
-            }
-        }
-
-        env.storage().instance().extend_ttl(
-            Self::INSTANCE_LIFETIME_THRESHOLD,
-            Self::INSTANCE_BUMP_AMOUNT,
-        );
-
-        env.events()
-            .publish((Symbol::new(&env, "action_executed"), admin), nonce);
-
-        log!(&env, "Timelock action executed for nonce {}", nonce);
-        Ok(())
+    /// Executes a batch of previously queued timelock actions sequentially within
+    /// a single atomic invocation.
+    ///
+    /// Requirements:
+    /// - The contract must not be frozen.
+    /// - Circuit breaker must be closed.
+    /// - The admin must authorize.
+    /// - All nonces in the batch must be verified ready and valid BEFORE any action is executed.
+    /// - All actions execute sequentially. If any action fails execution,
+    ///   the entire invocation reverts atomically.
+    /// - Emits `batch_actions_executed` event with the list of nonces.
+    pub fn execute_batch_actions(env: Env, nonces: Vec<u64>) -> Result<(), Error> {
+        timelock::execute_batch_actions(&env, nonces)
     }
 
     /// Cancels a pending timelock entry before it can be executed.
@@ -1764,7 +1702,7 @@ impl PaymentRouter {
     /// configuration, stores the backup admin and timeout, and starts the
     /// claim clock. Performs NO authorization; callers must do that first
     /// (direct admin call or timelock execution).
-    fn apply_set_backup_admin(
+    pub(crate) fn apply_set_backup_admin(
         env: &Env,
         backup: Address,
         timeout_seconds: u64,
@@ -3077,7 +3015,8 @@ impl PaymentRouter {
             return Err(Error::SlippageExceeded);
         }
         if swap.expected_amount_out > 0 {
-            let max_slippage_bps = Self::max_slippage_bps(env);
+            let max_slippage_bps =
+                Self::pair_max_slippage_bps(env, &swap.sell_token, &swap.buy_token)?;
             let slippage_floor = Self::slippage_floor(swap.expected_amount_out, max_slippage_bps);
             if amount_out < slippage_floor {
                 log!(
@@ -3252,7 +3191,7 @@ impl PaymentRouter {
             return Err(Error::InvalidSwapParams);
         }
 
-        let max_slippage_bps = Self::max_slippage_bps(&env);
+        let max_slippage_bps = Self::pair_max_slippage_bps(&env, &sell_token, &buy_token)?;
 
         Ok(SwapQuote {
             amount_out,
@@ -3389,6 +3328,39 @@ impl PaymentRouter {
     /// Does not panic.
     pub fn get_max_slippage_bps(env: Env) -> i128 {
         Self::max_slippage_bps(&env)
+    }
+
+    /// Returns the configured cap for `(token_in, token_out)`, or the global
+    /// cap when no pair override exists. Invalid stored overrides fail closed.
+    pub fn get_pair_max_slippage_bps(
+        env: Env,
+        token_in: Address,
+        token_out: Address,
+    ) -> Result<i128, Error> {
+        Self::pair_max_slippage_bps(&env, &token_in, &token_out)
+    }
+
+    /// Sets a pair-specific slippage cap. Prefer the timelocked
+    /// `SetPairMaxSlippageBps` action for production configuration.
+    pub fn set_pair_max_slippage_bps(
+        env: Env,
+        token_in: Address,
+        token_out: Address,
+        max_slippage_bps: i128,
+    ) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+        if !(0..=Self::MAX_PAIR_SLIPPAGE_BPS).contains(&max_slippage_bps) {
+            return Err(Error::InvalidSlippageConfig);
+        }
+        let key = DataKey::PairSlippage(token_in, token_out);
+        env.storage().persistent().set(&key, &max_slippage_bps);
+        env.storage().persistent().extend_ttl(
+            &key,
+            Self::PERSISTENT_LIFETIME_THRESHOLD,
+            Self::PERSISTENT_BUMP_AMOUNT,
+        );
+        Ok(())
     }
 
     /// Returns the available internal refund balance for a user and token.
